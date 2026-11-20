@@ -1,37 +1,30 @@
 #!/usr/bin/env python3
 """
 FreezeHost AFK - 自动挂机赚币脚本（支持多实例）
-使用 SeleniumBase UC 模式绕过 Cloudflare Turnstile + 广告拦截检测
+使用 SeleniumBase UC 模式
 """
 import os
 import time
 import platform
-import sys
-
-# Linux 服务器上需要虚拟显示器
-if platform.system().lower() == "linux":
-    from pyvirtualdisplay import Display
-    disp = Display(visible=False, size=(1920, 1080))
-    disp.start()
-    os.environ["DISPLAY"] = disp.new_display_var
-
 from seleniumbase import SB
 
 # Discord Token - 从环境变量读取，支持多个（逗号分隔）
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 
-# WARP 代理地址（可选，推荐使用）
-WARP_PROXY = os.environ.get("WARP_PROXY", "socks5://127.0.0.1:40000")
+# WARP 代理地址（默认留空，避免未启动 WARP 时连接超时卡死；需要时通过环境变量传入）
+WARP_PROXY = os.environ.get("WARP_PROXY", "").strip()
 
 # 最大运行时长（分钟），0 = 无限
 MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME", "0"))
 
-# 每个 session 赏币时长（秒）
+# 每个 session 赚币时长（秒）
 SESSION_DURATION = 1200  # 20 分钟
 
-# 实例编号（从命令行参数或环境变量获取）
+# 实例编号（从环境变量获取）
 INSTANCE_ID = int(os.environ.get("INSTANCE_ID", "0"))
 LOG_FILE = os.environ.get("LOG_FILE", "")
+
+global_start = 0.0
 
 
 def log(msg):
@@ -44,8 +37,12 @@ def log(msg):
         try:
             with open(LOG_FILE, "a") as f:
                 f.write(line + "\n")
-        except:
+        except Exception:
             pass
+
+
+def is_max_runtime_reached():
+    return MAX_RUNTIME > 0 and (time.time() - global_start) > MAX_RUNTIME * 60
 
 
 def wait_turnstile(sb, timeout=120):
@@ -58,14 +55,14 @@ def wait_turnstile(sb, timeout=120):
             )
             if val and len(str(val)) > 20:
                 return str(val)
-        except:
+        except Exception:
             pass
         now = time.time()
         if now - last_click > 5:
             try:
                 sb.uc_gui_click_captcha()
                 last_click = now
-            except:
+            except Exception:
                 pass
         time.sleep(2)
     return None
@@ -76,9 +73,15 @@ def login_via_discord_token(sb, token):
     sb.uc_open_with_reconnect("https://free.freezehost.pro", reconnect_time=5)
     time.sleep(5)
 
+    # 如果已经处于登录状态，直接返回
+    if sb.get_current_url().startswith("https://free.freezehost.pro") and not sb.is_element_present("#login-btn"):
+        log("Already logged in!")
+        return True
+
     try:
+        sb.wait_for_element_visible("button#login-btn", timeout=10)
         sb.click("button#login-btn")
-    except:
+    except Exception:
         sb.execute_script("document.getElementById('login-btn')?.click();")
     time.sleep(3)
 
@@ -86,9 +89,9 @@ def login_via_discord_token(sb, token):
         sb.wait_for_element_visible("button#confirm-login", timeout=5)
         sb.click("button#confirm-login")
         log("Confirmed terms")
-    except:
+    except Exception:
         log("No terms dialog")
-    time.sleep(2)
+    time.sleep(3)
 
     if "discord.com" in sb.get_current_url():
         log("Inject token...")
@@ -128,7 +131,9 @@ def login_via_discord_token(sb, token):
 
     url = sb.get_current_url()
     log("Login URL: %s" % url)
-    return url.startswith("https://free.freezehost.pro")
+    # 确认域名正确且登录按钮已消失，避免假登录成功
+    is_logged_in = url.startswith("https://free.freezehost.pro") and not sb.is_element_present("#login-btn")
+    return is_logged_in
 
 
 def click_start_afk(sb):
@@ -139,7 +144,7 @@ def click_start_afk(sb):
             var msg = document.getElementById('adblocker-message');
             if(msg) msg.style.display = 'none';
         """)
-    except:
+    except Exception:
         pass
 
     try:
@@ -147,7 +152,7 @@ def click_start_afk(sb):
             var btn = document.getElementById('start-afk-btn');
             if(btn){ btn.disabled = false; btn.textContent = 'Start AFK Session'; }
         """)
-    except:
+    except Exception:
         pass
 
     for attempt in range(3):
@@ -173,25 +178,26 @@ def click_start_afk(sb):
                     "return (typeof ws !== 'undefined' && ws) ? ws.readyState : -1;"
                 )
                 log("JS click - WS state: %s" % ws_state)
-                if ws_state == 0 or ws_state == 1:
+                if ws_state in (0, 1):
                     return True
-            except:
+            except Exception:
                 pass
     return False
 
 
 def run_earn_session(sb, session_num, token):
     log("Loading /earn...")
-    sb.uc_open_with_reconnect("https://free.freezehost.pro/earn", reconnect_time=6)
-    time.sleep(15)
+    # 改用普通 open，减少 UC 反复断连导致的 ChromeDriver 崩溃
+    sb.open("https://free.freezehost.pro/earn")
+    time.sleep(10)
 
     url = sb.get_current_url()
-    if not url.startswith("https://free.freezehost.pro"):
+    if not url.startswith("https://free.freezehost.pro") or sb.is_element_present("#login-btn"):
         log("Session expired, re-login...")
         if not login_via_discord_token(sb, token):
             return False
-        sb.uc_open_with_reconnect("https://free.freezehost.pro/earn", reconnect_time=6)
-        time.sleep(15)
+        sb.open("https://free.freezehost.pro/earn")
+        time.sleep(10)
 
     log("Waiting Turnstile...")
     token_val = wait_turnstile(sb, timeout=120)
@@ -199,7 +205,7 @@ def run_earn_session(sb, session_num, token):
         log("Turnstile failed!")
         try:
             sb.save_screenshot("/tmp/fh_fail_%d_%d.png" % (INSTANCE_ID, session_num))
-        except:
+        except Exception:
             pass
         return False
 
@@ -216,10 +222,10 @@ def run_earn_session(sb, session_num, token):
             if not url.startswith("https://free.freezehost.pro"):
                 log("Expired during earning")
                 break
-        except:
+        except Exception:
             break
 
-        if MAX_RUNTIME > 0 and (time.time() - global_start) > MAX_RUNTIME * 60:
+        if is_max_runtime_reached():
             log("Max runtime reached!")
             return None
 
@@ -252,36 +258,42 @@ def main():
     sb_options = {
         "uc": True,
         "test": True,
-        "headed": True,
+        "xvfb": platform.system().lower() == "linux",
         "chromium_arg": "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,720",
     }
 
     if WARP_PROXY:
         sb_options["proxy"] = WARP_PROXY
 
-    with SB(**sb_options) as sb:
-        if not login_via_discord_token(sb, token):
-            log("Login failed!")
-            return
-        log("Login OK!")
+    session = 0
+    while not is_max_runtime_reached():
+        try:
+            with SB(**sb_options) as sb:
+                if not login_via_discord_token(sb, token):
+                    log("Login failed! Retrying in 15s...")
+                    time.sleep(15)
+                    continue
+                log("Login OK!")
 
-        session = 0
-        while True:
-            if MAX_RUNTIME > 0 and (time.time() - global_start) > MAX_RUNTIME * 60:
-                log("Max runtime reached!")
+                while not is_max_runtime_reached():
+                    session += 1
+                    log("")
+                    log("=== Session #%d ===" % session)
+
+                    result = run_earn_session(sb, session, token)
+                    if result is None:
+                        return
+                    if not result:
+                        log("Session failed, retrying...")
+
+                    time.sleep(5)
+        except Exception as e:
+            # 捕获 ChromeDriver 崩溃 / ConnectionRefusedError，自动拉起新浏览器实例
+            log("Browser/Driver crashed: %s" % str(e)[:150])
+            if is_max_runtime_reached():
                 break
-
-            session += 1
-            log("")
-            log("=== Session #%d ===" % session)
-
-            result = run_earn_session(sb, session, token)
-            if result is None:
-                break
-            if not result:
-                log("Session failed, retrying...")
-
-            time.sleep(5)
+            log("Restarting browser in 10s...")
+            time.sleep(10)
 
     log("Done!")
 
